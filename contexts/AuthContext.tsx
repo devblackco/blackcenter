@@ -119,7 +119,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
      * Public refresh (no retry delay). Used for polling on the Pending page.
      */
     const refreshProfile = useCallback(async (userId: string): Promise<Profile | null> => {
-        setLoading(true);
+        // Silent refresh — does NOT touch the global `loading` flag so we never
+        // flash the full-screen spinner during polling (e.g. Pending page every 20 s).
         try {
             const { data, error } = await supabase
                 .from('user_profiles')
@@ -140,8 +141,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             console.error('[Auth] refreshProfile error:', err);
             setProfileError('NETWORK');
             return null;
-        } finally {
-            setLoading(false);
         }
     }, []);
 
@@ -153,14 +152,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // on mount which covers that case, eliminating the main race condition.
 
     useEffect(() => {
-        // Safety net: if something silently fails and loading is never cleared, unblock after 10 s.
-        const safetyTimer = setTimeout(() => {
-            console.warn('[Auth] Safety timeout (10 s) — forcing loading=false');
+        // The initial safety timer only covers the very first boot (INITIAL_SESSION).
+        // For subsequent events we use per-call timers (see handler below).
+        let bootSafetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+            console.warn('[Auth] Boot safety timeout (12 s) — forcing loading=false');
             setLoading(false);
-        }, 10_000);
+            bootSafetyTimer = null;
+        }, 12_000);
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, currentSession) => {
             console.log(`[Auth][${event}] userId=${currentSession?.user?.id ?? 'none'}`);
+
+            // Clear the one-shot boot timer on the very first event.
+            if (bootSafetyTimer !== null) {
+                clearTimeout(bootSafetyTimer);
+                bootSafetyTimer = null;
+            }
+
+            // Per-invocation safety timer. Only created when we actually set loading=true,
+            // so TOKEN_REFRESHED events that don't touch loading never leave it stuck.
+            let callSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
             try {
                 if (event === 'SIGNED_OUT') {
@@ -175,14 +186,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     setSession(currentSession);
                     setUser(currentSession.user);
 
-                    // Fetch profile on sign-in, initial session load, and token refresh
-                    if (
-                        event === 'SIGNED_IN' ||
-                        event === 'INITIAL_SESSION' ||
-                        event === 'TOKEN_REFRESHED'
-                    ) {
+                    if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
+                        // These events require a fresh profile load — show spinner.
                         setLoading(true);
+
+                        // Per-call fallback: if fetchProfile hangs, unblock after 12 s.
+                        callSafetyTimer = setTimeout(() => {
+                            console.warn(`[Auth][${event}] Per-call safety timeout — forcing loading=false`);
+                            setLoading(false);
+                        }, 12_000);
+
                         await fetchProfile(currentSession.user.id);
+
+                    } else if (event === 'TOKEN_REFRESHED') {
+                        // Token refresh only rotates the JWT — the profile on disk hasn't changed.
+                        // Do NOT set loading=true here; that was the root cause of the stuck spinner
+                        // after ~1 h (when Supabase silently refreshes the token).
+                        console.log('[Auth][TOKEN_REFRESHED] session updated, skipping profile re-fetch');
                     }
                 } else {
                     // currentSession is null — user is logged out
@@ -195,13 +215,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 console.error(`[Auth][${event}] handler error:`, err);
                 setProfileError('NETWORK');
             } finally {
-                clearTimeout(safetyTimer);
+                if (callSafetyTimer !== null) {
+                    clearTimeout(callSafetyTimer);
+                }
                 setLoading(false);
             }
         });
 
         return () => {
-            clearTimeout(safetyTimer);
+            if (bootSafetyTimer !== null) clearTimeout(bootSafetyTimer);
             subscription.unsubscribe();
         };
     }, [fetchProfile]);
