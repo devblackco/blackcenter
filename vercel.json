@@ -2,11 +2,7 @@
     "rewrites": [
         {
             "source": "/(.*)",
-            "destination": "/index.html"
+            "destination": "/"
         }
-    ],
-    "buildCommand": "npm run build",
-    "outputDirectory": "dist",
-    "installCommand": "npm install",
-    "framework": "vite"
+    ]
 }

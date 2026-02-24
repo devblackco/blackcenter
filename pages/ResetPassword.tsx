@@ -26,15 +26,11 @@ const ResetPassword = () => {
             isInteracting.current = true;
 
             try {
-                // 1. Extrair parâmetros do HASH conforme solicitado (Double Hash support)
-                // Usando window.location.hash.substring(1) para pegar o fragmento
-                // Se houver múltiplos hashes, o split('#').pop() ainda é mais seguro para pegar os tokens
-                const hash = window.location.hash.substring(1);
-                // No caso de HashRouter, o hash pode ser algo como #/reset-password#access_token=...
-                // O substring(1) tira o primeiro #, sobrando /reset-password#access_token=...
-                // O split('#').pop() pega exatamente a parte dos tokens.
-                const tokenPart = hash.split('#').pop() || '';
-                const params = new URLSearchParams(tokenPart);
+                // 1. Extrair tokens do fragmento — com BrowserRouter o Supabase entrega:
+                // /reset-password#access_token=xxx&refresh_token=yyy
+                // O fragmento é direto, sem prefixo de rota.
+                const hash = window.location.hash.substring(1); // remove o '#' inicial
+                const params = new URLSearchParams(hash);
 
                 const accessToken = params.get('access_token');
                 const refreshToken = params.get('refresh_token');
@@ -51,8 +47,8 @@ const ResetPassword = () => {
                     if (!sessionError && data.session) {
                         console.log('ResetPassword: Sessão estabelecida com sucesso.');
 
-                        // Clean URL — remove tokens from hash, keep just the route
-                        window.history.replaceState(null, '', `${window.location.origin}${window.location.pathname}#/reset-password`);
+                        // Clean URL — remove tokens do fragmento, mantém a rota limpa
+                        window.history.replaceState(null, '', `${window.location.origin}${window.location.pathname}`);
 
                         setPageState('READY');
                         return;
