@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext';
 import type { UserRole } from '../types';
 import { useRole } from '../hooks/useRole';
 import type { ProfileError } from '../contexts/AuthContext';
-import { AlertTriangle, ShieldOff, WifiOff, UserX, Settings } from 'lucide-react';
+import { AlertTriangle, ShieldOff, WifiOff, UserX, Settings, Shield } from 'lucide-react';
 
 interface ProtectedRouteProps {
     children?: React.ReactNode;
@@ -40,6 +40,12 @@ const profileErrorConfig: Record<
         iconClass: 'text-orange-500',
         title: 'Configuração ausente',
         body: 'As variáveis VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY não estão configuradas neste ambiente. Adicione-as nas configurações da Vercel.',
+    },
+    BLOCKED: {
+        icon: Shield,
+        iconClass: 'text-purple-500',
+        title: 'Request bloqueada',
+        body: 'O browser impediu a conexão com o servidor. Desative VPN, extensões de privacidade ou adblock e tente novamente.',
     },
 };
 

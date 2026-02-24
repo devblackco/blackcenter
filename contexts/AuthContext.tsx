@@ -7,7 +7,13 @@ import type { Profile, UserRole, UserStatus } from '../types';
 export type { Profile, UserRole, UserStatus };
 
 // ─── Error Categories ────────────────────────────────────────────────────────
-export type ProfileError = 'NOT_FOUND' | 'ACCESS_DENIED' | 'NETWORK' | 'ENV_MISSING' | null;
+export type ProfileError =
+    | 'NOT_FOUND'     // profile row does not exist in user_profiles
+    | 'ACCESS_DENIED' // RLS/401/403 blocked the SELECT
+    | 'NETWORK'       // real network error (not a block)
+    | 'ENV_MISSING'   // VITE_SUPABASE_* vars not set
+    | 'BLOCKED'       // browser extension / VPN / adblock intercepted before request went out
+    | null;
 
 // ─── Context Shape ───────────────────────────────────────────────────────────
 interface AuthContextType {
@@ -28,6 +34,14 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+// ─── Fetch timeout (ms) ──────────────────────────────────────────────────────
+// Each attempt() aborts after this time so a frozen promise can never hang forever.
+const FETCH_TIMEOUT_MS = 8_000;
+
+// ─── Safety timeout (ms) ─────────────────────────────────────────────────────
+// If the entire fetchProfile (attempt + retry) takes longer than this, force unblock.
+const SAFETY_TIMEOUT_MS = 12_000;
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [user, setUser] = useState<User | null>(null);
     const [profile, setProfile] = useState<Profile | null>(null);
@@ -44,54 +58,104 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     /**
      * Categorise a Supabase PostgREST error into a ProfileError enum value.
      * NOTE: when using .maybeSingle(), a missing row returns data=null, error=null.
-     * That case is handled by the caller (not passed here). This function only
-     * receives actual error objects.
+     * That case is handled by the caller. This function only receives actual error objects.
      */
-    const categoriseError = (error: any): ProfileError => {
-        if (!error) return 'NETWORK'; // should not happen, but safe fallback
+    const categoriseError = useCallback((error: any): ProfileError => {
+        if (!error) return 'NETWORK';
+
+        // Abort / Timeout — request hung and was forcibly cancelled
+        if (error?.name === 'AbortError' || error?.code === 'ABORT') return 'BLOCKED';
+
+        // Browser extension / VPN / adblock intercepted before the request went out
+        if (
+            error?.message?.toLowerCase?.().includes('blocked') ||
+            error?.message?.toLowerCase?.().includes('err_blocked') ||
+            error?.message?.toLowerCase?.().includes('net::err')
+        ) return 'BLOCKED';
+
         // Placeholder client = ENV vars missing in the deploy
         if (error?.message?.includes?.('placeholder')) return 'ENV_MISSING';
-        // PGRST116 = .single() with no row (should not happen with .maybeSingle, but defensive)
+
+        // PGRST116 = .single() with no row (defensive – we use .maybeSingle())
         if (error?.code === 'PGRST116') return 'NOT_FOUND';
+
         // 401/403 from RLS
         if (error?.status === 401 || error?.status === 403) return 'ACCESS_DENIED';
-        // Network / fetch failures
-        if (error?.message?.toLowerCase?.().includes('fetch') ||
+
+        // Generic network/fetch failures
+        if (
+            error?.message?.toLowerCase?.().includes('fetch') ||
             error?.message?.toLowerCase?.().includes('network') ||
-            error?.message?.toLowerCase?.().includes('failed to')) return 'NETWORK';
+            error?.message?.toLowerCase?.().includes('failed to')
+        ) return 'NETWORK';
+
         return 'NETWORK';
-    };
+    }, []);
+
+    /**
+     * Single attempt to fetch user_profiles with an AbortController timeout.
+     * Returns { data, error } — never throws. If the fetch hangs or is blocked,
+     * it is forcibly aborted after FETCH_TIMEOUT_MS and returns error.code='ABORT'.
+     */
+    const attempt = useCallback(async (userId: string): Promise<{ data: Profile | null; error: any }> => {
+        const ac = new AbortController();
+        const abortTimer = setTimeout(() => {
+            ac.abort('timeout');
+        }, FETCH_TIMEOUT_MS);
+
+        try {
+            const { data, error } = await (supabase
+                .from('user_profiles')
+                .select('*')
+                .eq('user_id', userId)
+                .maybeSingle() as any).abortSignal(ac.signal);
+
+            return { data: data as Profile | null, error };
+        } catch (err: any) {
+            // AbortError fires when ac.abort() is called (timeout or deliberate)
+            if (err?.name === 'AbortError') {
+                console.warn(`[Auth][attempt] aborted after ${FETCH_TIMEOUT_MS / 1000} s — likely blocked by browser/extension/VPN`);
+                return { data: null, error: { name: 'AbortError', code: 'ABORT', message: `Request abortada após ${FETCH_TIMEOUT_MS / 1000} s (browser pode estar bloqueando requests ao Supabase)` } };
+            }
+            // TypeError: Failed to fetch — request never left the browser
+            if (err?.name === 'TypeError') {
+                console.warn('[Auth][attempt] TypeError (Failed to fetch) — request intercepted before leaving browser:', err.message);
+                return { data: null, error: { name: 'TypeError', code: 'BLOCKED', message: err.message } };
+            }
+            return { data: null, error: err };
+        } finally {
+            clearTimeout(abortTimer);
+        }
+    }, []);
 
     /**
      * Fetches and commits the profile. Returns profile or null.
      * Uses fetchRequestRef to discard stale (race-condition) responses.
-     * Retries once (1.5 s delay) to handle slow trigger after signup.
+     * Retries once after 1.5 s to handle slow triggers after signup.
      */
     const fetchProfile = useCallback(async (userId: string): Promise<Profile | null> => {
         const myRequestId = ++fetchRequestRef.current;
+        const startedAt = Date.now();
 
-        console.log(`[Auth][fetchProfile] attempt — userId=${userId} requestId=${myRequestId}`);
-
-        const attempt = async (): Promise<{ data: Profile | null; error: any }> => {
-            // .maybeSingle() returns { data: null, error: null } when no row exists.
-            // .single() would throw PGRST116, which is misleading and harder to distinguish from RLS.
-            const { data, error } = await supabase
-                .from('user_profiles')
-                .select('*')
-                .eq('user_id', userId)
-                .maybeSingle();
-            return { data: data as Profile | null, error };
-        };
+        console.log(`[Auth][fetchProfile] START userId=${userId} requestId=${myRequestId} t=0ms`);
 
         try {
-            let { data, error } = await attempt();
+            let { data, error } = await attempt(userId);
 
-            // Retry once if: there's an error OR data is null (profile not found yet — trigger may be slow)
+            const t1 = Date.now() - startedAt;
+            console.log(`[Auth][fetchProfile] attempt-1 done in ${t1}ms — data=${!!data} error=${error?.code ?? error?.message ?? 'none'}`);
+
+            // Retry once if: errors, abort, or no data (trigger may be slow after signup)
             if (!data) {
-                const reason = error ? `error: ${error.code ?? error.message}` : 'row not found (maybeSingle)';
-                console.log(`[Auth][fetchProfile] first attempt returned no data (${reason}) — retrying in 1.5 s (requestId=${myRequestId})`);
+                const reason = error
+                    ? `code=${error.code ?? error.name} msg="${error.message}"`
+                    : 'row not found (maybeSingle returned null)';
+                console.log(`[Auth][fetchProfile] retrying in 1.5 s — ${reason} (requestId=${myRequestId})`);
                 await new Promise(resolve => setTimeout(resolve, 1500));
-                ({ data, error } = await attempt());
+                ({ data, error } = await attempt(userId));
+
+                const t2 = Date.now() - startedAt;
+                console.log(`[Auth][fetchProfile] attempt-2 done in ${t2}ms — data=${!!data} error=${error?.code ?? error?.message ?? 'none'}`);
             }
 
             // Stale response — a newer fetchProfile already completed
@@ -101,48 +165,43 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
 
             if (data) {
-                console.log(`[Auth][fetchProfile] success — status=${data.status} role=${data.role}`);
+                console.log(`[Auth][fetchProfile] SUCCESS status=${data.status} role=${data.role} t=${Date.now() - startedAt}ms`);
                 setProfile(data);
                 setProfileError(null);
                 return data;
             }
 
-            // Profile definitely does not exist (data=null, error=null from maybeSingle)
+            // Profile row definitely missing (maybeSingle: data=null, error=null)
             if (!data && !error) {
-                console.warn(`[Auth][fetchProfile] profile row missing for userId=${userId}`);
+                console.warn(`[Auth][fetchProfile] MISSING — no row in user_profiles for userId=${userId}`);
                 setProfile(null);
                 setProfileError('NOT_FOUND');
                 return null;
             }
 
-            // Actual error (RLS, network, etc.)
+            // Real error: RLS, block, network, etc.
             const category = categoriseError(error);
-            console.warn(`[Auth][fetchProfile] failed — category=${category} code=${error?.code} status=${error?.status}`, error);
+            console.warn(`[Auth][fetchProfile] FAILED category=${category} code=${error?.code} status=${error?.status} msg="${error?.message}" t=${Date.now() - startedAt}ms`);
             setProfile(null);
             setProfileError(category);
             return null;
 
-        } catch (err) {
+        } catch (err: any) {
             if (myRequestId !== fetchRequestRef.current) return null;
-            console.error('[Auth][fetchProfile] exception:', err);
+            console.error('[Auth][fetchProfile] unexpected exception:', err);
             setProfile(null);
-            setProfileError('NETWORK');
+            setProfileError(categoriseError(err));
             return null;
         }
-    }, []);
+    }, [attempt, categoriseError]);
 
     /**
-     * Public refresh (no retry delay). Used for polling on the Pending page.
+     * Public silent refresh (no retry, no loading spinner).
+     * Used for manual retry button and Pending page polling.
      */
     const refreshProfile = useCallback(async (userId: string): Promise<Profile | null> => {
-        // Silent refresh — does NOT touch the global `loading` flag so we never
-        // flash the full-screen spinner during polling (e.g. Pending page every 20 s).
         try {
-            const { data, error } = await supabase
-                .from('user_profiles')
-                .select('*')
-                .eq('user_id', userId)
-                .maybeSingle();
+            const { data, error } = await attempt(userId);
 
             if (data) {
                 setProfile(data as Profile);
@@ -155,43 +214,40 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 return null;
             }
 
-            const category = categoriseError(error);
-            setProfileError(category);
+            setProfileError(categoriseError(error));
             return null;
         } catch (err) {
             console.error('[Auth] refreshProfile error:', err);
-            setProfileError('NETWORK');
+            setProfileError(categoriseError(err));
             return null;
         }
-    }, []);
+    }, [attempt, categoriseError]);
 
     // ─── Bootstrap ──────────────────────────────────────────────────────────
     //
     // SINGLE SOURCE OF TRUTH: onAuthStateChange is the only place that reads
     // the session and fetches the profile. We intentionally do NOT call
     // supabase.auth.getSession() separately — the listener fires INITIAL_SESSION
-    // on mount which covers that case, eliminating the main race condition.
+    // on mount, eliminating the main race condition.
 
     useEffect(() => {
-        // The initial safety timer only covers the very first boot (INITIAL_SESSION).
-        // For subsequent events we use per-call timers (see handler below).
+        // Boot safety: if onAuthStateChange never fires (e.g. Supabase fully unreachable)
         let bootSafetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-            console.warn('[Auth] Boot safety timeout (12 s) — forcing loading=false');
+            console.warn('[Auth] Boot safety timeout (12 s) — Supabase likely unreachable at init');
+            setProfileError('BLOCKED');
             setLoading(false);
             bootSafetyTimer = null;
-        }, 12_000);
+        }, SAFETY_TIMEOUT_MS);
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, currentSession) => {
             console.log(`[Auth][${event}] userId=${currentSession?.user?.id ?? 'none'}`);
 
-            // Clear the one-shot boot timer on the very first event.
+            // Clear the one-shot boot timer on the very first event
             if (bootSafetyTimer !== null) {
                 clearTimeout(bootSafetyTimer);
                 bootSafetyTimer = null;
             }
 
-            // Per-invocation safety timer. Only created when we actually set loading=true,
-            // so TOKEN_REFRESHED events that don't touch loading never leave it stuck.
             let callSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
             try {
@@ -201,7 +257,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     setProfile(null);
                     setProfileError(null);
                     setLoading(false);
-                    return; // skip finally's setLoading(false) — already done
+                    return; // skip finally
                 }
 
                 if (currentSession) {
@@ -209,25 +265,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     setUser(currentSession.user);
 
                     if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
-                        // These events require a fresh profile load — show spinner.
                         setLoading(true);
 
-                        // Per-call fallback: if fetchProfile hangs, unblock after 12 s.
+                        // Per-call fallback: if fetchProfile hangs past SAFETY_TIMEOUT_MS,
+                        // force-unblock AND set an error so the UI shows something actionable.
                         callSafetyTimer = setTimeout(() => {
-                            console.warn(`[Auth][${event}] Per-call safety timeout — forcing loading=false`);
+                            console.warn(`[Auth][${event}] Per-call safety timeout (${SAFETY_TIMEOUT_MS / 1000} s) — setting BLOCKED`);
+                            setProfileError('BLOCKED');
                             setLoading(false);
-                        }, 12_000);
+                        }, SAFETY_TIMEOUT_MS);
 
                         await fetchProfile(currentSession.user.id);
 
                     } else if (event === 'TOKEN_REFRESHED') {
-                        // Token refresh only rotates the JWT — the profile on disk hasn't changed.
-                        // Do NOT set loading=true here; that was the root cause of the stuck spinner
-                        // after ~1 h (when Supabase silently refreshes the token).
-                        console.log('[Auth][TOKEN_REFRESHED] session updated, skipping profile re-fetch');
+                        // Token refresh only rotates the JWT — profile on disk hasn't changed.
+                        // Do NOT re-fetch or set loading=true to avoid stuck spinner after ~1 h.
+                        console.log('[Auth][TOKEN_REFRESHED] session rotated — profile kept as-is');
                     }
                 } else {
-                    // currentSession is null — user is logged out
                     setSession(null);
                     setUser(null);
                     setProfile(null);
@@ -235,11 +290,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 }
             } catch (err) {
                 console.error(`[Auth][${event}] handler error:`, err);
-                setProfileError('NETWORK');
+                setProfileError(categoriseError(err));
             } finally {
-                if (callSafetyTimer !== null) {
-                    clearTimeout(callSafetyTimer);
-                }
+                if (callSafetyTimer !== null) clearTimeout(callSafetyTimer);
                 setLoading(false);
             }
         });
@@ -248,7 +301,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (bootSafetyTimer !== null) clearTimeout(bootSafetyTimer);
             subscription.unsubscribe();
         };
-    }, [fetchProfile]);
+    }, [fetchProfile, categoriseError]);
 
     // ─── Auth Actions ────────────────────────────────────────────────────────
 
