@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext';
 import type { UserRole } from '../types';
 import { useRole } from '../hooks/useRole';
 import type { ProfileError } from '../contexts/AuthContext';
-import { AlertTriangle, ShieldOff, WifiOff, UserX } from 'lucide-react';
+import { AlertTriangle, ShieldOff, WifiOff, UserX, Settings } from 'lucide-react';
 
 interface ProtectedRouteProps {
     children?: React.ReactNode;
@@ -27,13 +27,19 @@ const profileErrorConfig: Record<
         icon: ShieldOff,
         iconClass: 'text-red-500',
         title: 'Sem permissão',
-        body: 'Não foi possível ler seus dados de perfil. Contate o administrador (erro de permissão).',
+        body: 'Não foi possível ler seus dados de perfil. Contate o administrador (erro de permissão / RLS).',
     },
     NETWORK: {
         icon: WifiOff,
         iconClass: 'text-slate-400',
         title: 'Falha de rede',
         body: 'Não foi possível conectar ao servidor. Verifique sua conexão e tente novamente.',
+    },
+    ENV_MISSING: {
+        icon: Settings,
+        iconClass: 'text-orange-500',
+        title: 'Configuração ausente',
+        body: 'As variáveis VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY não estão configuradas neste ambiente. Adicione-as nas configurações da Vercel.',
     },
 };
 

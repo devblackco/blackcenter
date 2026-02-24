@@ -7,7 +7,7 @@ import type { Profile, UserRole, UserStatus } from '../types';
 export type { Profile, UserRole, UserStatus };
 
 // ─── Error Categories ────────────────────────────────────────────────────────
-export type ProfileError = 'NOT_FOUND' | 'ACCESS_DENIED' | 'NETWORK' | null;
+export type ProfileError = 'NOT_FOUND' | 'ACCESS_DENIED' | 'NETWORK' | 'ENV_MISSING' | null;
 
 // ─── Context Shape ───────────────────────────────────────────────────────────
 interface AuthContextType {
@@ -43,17 +43,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     /**
      * Categorise a Supabase PostgREST error into a ProfileError enum value.
+     * NOTE: when using .maybeSingle(), a missing row returns data=null, error=null.
+     * That case is handled by the caller (not passed here). This function only
+     * receives actual error objects.
      */
     const categoriseError = (error: any): ProfileError => {
-        // PGRST116 = "JSON object requested, multiple (or no) rows returned" → row missing
-        if (error?.code === 'PGRST116' || error?.details?.includes?.('0 rows')) return 'NOT_FOUND';
+        if (!error) return 'NETWORK'; // should not happen, but safe fallback
+        // Placeholder client = ENV vars missing in the deploy
+        if (error?.message?.includes?.('placeholder')) return 'ENV_MISSING';
+        // PGRST116 = .single() with no row (should not happen with .maybeSingle, but defensive)
+        if (error?.code === 'PGRST116') return 'NOT_FOUND';
         // 401/403 from RLS
         if (error?.status === 401 || error?.status === 403) return 'ACCESS_DENIED';
-        // Anything that looks like a network/fetch error
+        // Network / fetch failures
         if (error?.message?.toLowerCase?.().includes('fetch') ||
-            error?.message?.toLowerCase?.().includes('network')) return 'NETWORK';
-        // Empty result without explicit error code → treat as not found
-        if (!error) return 'NOT_FOUND';
+            error?.message?.toLowerCase?.().includes('network') ||
+            error?.message?.toLowerCase?.().includes('failed to')) return 'NETWORK';
         return 'NETWORK';
     };
 
@@ -68,20 +73,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.log(`[Auth][fetchProfile] attempt — userId=${userId} requestId=${myRequestId}`);
 
         const attempt = async (): Promise<{ data: Profile | null; error: any }> => {
+            // .maybeSingle() returns { data: null, error: null } when no row exists.
+            // .single() would throw PGRST116, which is misleading and harder to distinguish from RLS.
             const { data, error } = await supabase
                 .from('user_profiles')
                 .select('*')
                 .eq('user_id', userId)
-                .single();
+                .maybeSingle();
             return { data: data as Profile | null, error };
         };
 
         try {
             let { data, error } = await attempt();
 
-            // Retry once if the trigger hasn't run yet (slow signup)
-            if (!data && error) {
-                console.log(`[Auth][fetchProfile] not found on first try — retrying in 1.5 s (requestId=${myRequestId})`);
+            // Retry once if: there's an error OR data is null (profile not found yet — trigger may be slow)
+            if (!data) {
+                const reason = error ? `error: ${error.code ?? error.message}` : 'row not found (maybeSingle)';
+                console.log(`[Auth][fetchProfile] first attempt returned no data (${reason}) — retrying in 1.5 s (requestId=${myRequestId})`);
                 await new Promise(resolve => setTimeout(resolve, 1500));
                 ({ data, error } = await attempt());
             }
@@ -99,9 +107,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 return data;
             }
 
-            // Persistent error after retry
+            // Profile definitely does not exist (data=null, error=null from maybeSingle)
+            if (!data && !error) {
+                console.warn(`[Auth][fetchProfile] profile row missing for userId=${userId}`);
+                setProfile(null);
+                setProfileError('NOT_FOUND');
+                return null;
+            }
+
+            // Actual error (RLS, network, etc.)
             const category = categoriseError(error);
-            console.warn(`[Auth][fetchProfile] failed — category=${category}`, error);
+            console.warn(`[Auth][fetchProfile] failed — category=${category} code=${error?.code} status=${error?.status}`, error);
             setProfile(null);
             setProfileError(category);
             return null;
@@ -126,12 +142,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 .from('user_profiles')
                 .select('*')
                 .eq('user_id', userId)
-                .single();
+                .maybeSingle();
 
             if (data) {
                 setProfile(data as Profile);
                 setProfileError(null);
                 return data as Profile;
+            }
+
+            if (!data && !error) {
+                setProfileError('NOT_FOUND');
+                return null;
             }
 
             const category = categoriseError(error);
@@ -179,7 +200,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     setUser(null);
                     setProfile(null);
                     setProfileError(null);
-                    return;
+                    setLoading(false);
+                    return; // skip finally's setLoading(false) — already done
                 }
 
                 if (currentSession) {
