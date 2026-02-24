@@ -13,4 +13,13 @@ export const supabaseConfigError: string | null =
 
 export const supabase: SupabaseClient = supabaseConfigError
     ? createClient('https://placeholder.supabase.co', 'placeholder-key')
-    : createClient(supabaseUrl!, supabaseAnonKey!);
+    : createClient(supabaseUrl!, supabaseAnonKey!, {
+        auth: {
+            persistSession: true,
+            autoRefreshToken: true,
+            // Required for reset-password / magic-link flows (reads tokens from URL hash)
+            detectSessionInUrl: true,
+            // Isolates localStorage key from other Supabase apps on the same origin
+            storageKey: 'blackcenter-auth',
+        },
+    });

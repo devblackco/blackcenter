@@ -6,11 +6,16 @@ import type { Profile, UserRole, UserStatus } from '../types';
 // Re-export for backward compatibility
 export type { Profile, UserRole, UserStatus };
 
+// ─── Error Categories ────────────────────────────────────────────────────────
+export type ProfileError = 'NOT_FOUND' | 'ACCESS_DENIED' | 'NETWORK' | null;
+
+// ─── Context Shape ───────────────────────────────────────────────────────────
 interface AuthContextType {
     user: User | null;
     profile: Profile | null;
     session: Session | null;
     loading: boolean;
+    profileError: ProfileError;
     signIn: (email: string, password: string) => Promise<{ error: AuthError | null }>;
     signUp: (email: string, password: string, name: string) => Promise<{ error: AuthError | null }>;
     signOut: () => Promise<void>;
@@ -28,13 +33,92 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const [profile, setProfile] = useState<Profile | null>(null);
     const [session, setSession] = useState<Session | null>(null);
     const [loading, setLoading] = useState(true);
-    const initDone = useRef(false);
+    const [profileError, setProfileError] = useState<ProfileError>(null);
+
+    // Incremented on every fetchProfile call.
+    // Only the response matching the latest ID may commit to state (prevents stale writes).
+    const fetchRequestRef = useRef(0);
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
     /**
-     * Unified profile fetcher. Tries once, if not found waits 1.5s and retries
-     * (handles slow trigger after signup). Never throws — returns null on failure.
+     * Categorise a Supabase PostgREST error into a ProfileError enum value.
+     */
+    const categoriseError = (error: any): ProfileError => {
+        // PGRST116 = "JSON object requested, multiple (or no) rows returned" → row missing
+        if (error?.code === 'PGRST116' || error?.details?.includes?.('0 rows')) return 'NOT_FOUND';
+        // 401/403 from RLS
+        if (error?.status === 401 || error?.status === 403) return 'ACCESS_DENIED';
+        // Anything that looks like a network/fetch error
+        if (error?.message?.toLowerCase?.().includes('fetch') ||
+            error?.message?.toLowerCase?.().includes('network')) return 'NETWORK';
+        // Empty result without explicit error code → treat as not found
+        if (!error) return 'NOT_FOUND';
+        return 'NETWORK';
+    };
+
+    /**
+     * Fetches and commits the profile. Returns profile or null.
+     * Uses fetchRequestRef to discard stale (race-condition) responses.
+     * Retries once (1.5 s delay) to handle slow trigger after signup.
      */
     const fetchProfile = useCallback(async (userId: string): Promise<Profile | null> => {
+        const myRequestId = ++fetchRequestRef.current;
+
+        console.log(`[Auth][fetchProfile] attempt — userId=${userId} requestId=${myRequestId}`);
+
+        const attempt = async (): Promise<{ data: Profile | null; error: any }> => {
+            const { data, error } = await supabase
+                .from('user_profiles')
+                .select('*')
+                .eq('user_id', userId)
+                .single();
+            return { data: data as Profile | null, error };
+        };
+
+        try {
+            let { data, error } = await attempt();
+
+            // Retry once if the trigger hasn't run yet (slow signup)
+            if (!data && error) {
+                console.log(`[Auth][fetchProfile] not found on first try — retrying in 1.5 s (requestId=${myRequestId})`);
+                await new Promise(resolve => setTimeout(resolve, 1500));
+                ({ data, error } = await attempt());
+            }
+
+            // Stale response — a newer fetchProfile already completed
+            if (myRequestId !== fetchRequestRef.current) {
+                console.log(`[Auth][fetchProfile] stale response discarded (requestId=${myRequestId})`);
+                return null;
+            }
+
+            if (data) {
+                console.log(`[Auth][fetchProfile] success — status=${data.status} role=${data.role}`);
+                setProfile(data);
+                setProfileError(null);
+                return data;
+            }
+
+            // Persistent error after retry
+            const category = categoriseError(error);
+            console.warn(`[Auth][fetchProfile] failed — category=${category}`, error);
+            setProfile(null);
+            setProfileError(category);
+            return null;
+
+        } catch (err) {
+            if (myRequestId !== fetchRequestRef.current) return null;
+            console.error('[Auth][fetchProfile] exception:', err);
+            setProfile(null);
+            setProfileError('NETWORK');
+            return null;
+        }
+    }, []);
+
+    /**
+     * Public refresh (no retry delay). Used for polling on the Pending page.
+     */
+    const refreshProfile = useCallback(async (userId: string): Promise<Profile | null> => {
         try {
             const { data, error } = await supabase
                 .from('user_profiles')
@@ -44,80 +128,43 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
             if (data) {
                 setProfile(data as Profile);
+                setProfileError(null);
                 return data as Profile;
             }
 
-            if (error) {
-                console.log('[Auth] Profile not found on first try, retrying in 1.5s...');
-            }
-
-            // Retry once — trigger may be slow after signup
-            await new Promise(resolve => setTimeout(resolve, 1500));
-
-            const { data: retryData } = await supabase
-                .from('user_profiles')
-                .select('*')
-                .eq('user_id', userId)
-                .single();
-
-            if (retryData) {
-                setProfile(retryData as Profile);
-                return retryData as Profile;
-            }
-
-            console.warn('[Auth] Profile still missing after retry for user:', userId);
-            setProfile(null);
-            return null;
-        } catch (err) {
-            console.error('[Auth] fetchProfile error:', err);
-            setProfile(null);
-            return null;
-        }
-    }, []);
-
-    /**
-     * Public version of fetchProfile — no retry delay.
-     * Used for manual/polling refreshes (e.g. the Pending page).
-     */
-    const refreshProfile = useCallback(async (userId: string): Promise<Profile | null> => {
-        try {
-            const { data } = await supabase
-                .from('user_profiles')
-                .select('*')
-                .eq('user_id', userId)
-                .single();
-
-            if (data) {
-                setProfile(data as Profile);
-                return data as Profile;
-            }
+            const category = categoriseError(error);
+            setProfileError(category);
             return null;
         } catch (err) {
             console.error('[Auth] refreshProfile error:', err);
+            setProfileError('NETWORK');
             return null;
         }
     }, []);
 
-    useEffect(() => {
-        // Safety timeout — if loading is still true after 8s, force it off.
-        // Prevents infinite spinner when DB trigger is slow or profile is missing.
-        const safetyTimer = setTimeout(() => {
-            if (!initDone.current) {
-                console.warn('[Auth] Safety timeout reached. Forcing loading=false.');
-                setLoading(false);
-                initDone.current = true;
-            }
-        }, 8000);
+    // ─── Bootstrap ──────────────────────────────────────────────────────────
+    //
+    // SINGLE SOURCE OF TRUTH: onAuthStateChange is the only place that reads
+    // the session and fetches the profile. We intentionally do NOT call
+    // supabase.auth.getSession() separately — the listener fires INITIAL_SESSION
+    // on mount which covers that case, eliminating the main race condition.
 
-        // 1. Set up auth listener FIRST
+    useEffect(() => {
+        // Safety net: if something silently fails and loading is never cleared, unblock after 10 s.
+        const safetyTimer = setTimeout(() => {
+            console.warn('[Auth] Safety timeout (10 s) — forcing loading=false');
+            setLoading(false);
+        }, 10_000);
+
         const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, currentSession) => {
-            console.log('[Auth] onAuthStateChange:', event);
+            console.log(`[Auth][${event}] userId=${currentSession?.user?.id ?? 'none'}`);
 
             try {
                 if (event === 'SIGNED_OUT') {
                     setSession(null);
                     setUser(null);
                     setProfile(null);
+                    setProfileError(null);
                     return;
                 }
 
@@ -125,60 +172,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                     setSession(currentSession);
                     setUser(currentSession.user);
 
-                    // For sign-in and initial session, fetch profile.
-                    // Set loading=true first so ProtectedRoute shows spinner
-                    // and never sees an intermediate profile=null state.
-                    if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
+                    // Fetch profile on sign-in, initial session load, and token refresh
+                    if (
+                        event === 'SIGNED_IN' ||
+                        event === 'INITIAL_SESSION' ||
+                        event === 'TOKEN_REFRESHED'
+                    ) {
                         setLoading(true);
                         await fetchProfile(currentSession.user.id);
                     }
                 } else {
+                    // currentSession is null — user is logged out
                     setSession(null);
                     setUser(null);
                     setProfile(null);
+                    setProfileError(null);
                 }
             } catch (err) {
-                console.error('[Auth] onAuthStateChange handler error:', err);
+                console.error(`[Auth][${event}] handler error:`, err);
+                setProfileError('NETWORK');
             } finally {
+                clearTimeout(safetyTimer);
                 setLoading(false);
-                initDone.current = true;
             }
         });
-
-        // 2. Bootstrap with getSession (fires onAuthStateChange with INITIAL_SESSION)
-        const initSession = async () => {
-            try {
-                const { data: { session: initialSession }, error } = await supabase.auth.getSession();
-
-                if (error) {
-                    console.error('[Auth] getSession error:', error);
-                }
-
-                // If onAuthStateChange already handled everything, skip
-                if (initDone.current) return;
-
-                if (initialSession) {
-                    setSession(initialSession);
-                    setUser(initialSession.user);
-                    await fetchProfile(initialSession.user.id);
-                }
-            } catch (err) {
-                console.error('[Auth] initSession error:', err);
-            } finally {
-                if (!initDone.current) {
-                    setLoading(false);
-                    initDone.current = true;
-                }
-            }
-        };
-
-        initSession();
 
         return () => {
             clearTimeout(safetyTimer);
             subscription.unsubscribe();
         };
     }, [fetchProfile]);
+
+    // ─── Auth Actions ────────────────────────────────────────────────────────
 
     const signIn = async (email: string, password: string) => {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
@@ -196,11 +221,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const signOut = async () => {
         try {
-            // Clear local state immediately for instant UI feedback
             setProfile(null);
             setUser(null);
             setSession(null);
             setLoading(false);
+            setProfileError(null);
             await supabase.auth.signOut();
         } catch (error) {
             console.error('[Auth] signOut error:', error);
@@ -258,11 +283,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
     };
 
+    // ─── Context Value ───────────────────────────────────────────────────────
+
     const value: AuthContextType = {
         user,
         profile,
         session,
         loading,
+        profileError,
         signIn,
         signUp,
         signOut,
