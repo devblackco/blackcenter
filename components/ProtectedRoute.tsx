@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext';
 import type { UserRole } from '../types';
 import { useRole } from '../hooks/useRole';
 import type { ProfileError } from '../contexts/AuthContext';
-import { AlertCircle, ShieldOff, WifiOff, UserX } from 'lucide-react';
+import { AlertTriangle, ShieldOff, WifiOff, UserX } from 'lucide-react';
 
 interface ProtectedRouteProps {
     children?: React.ReactNode;
@@ -52,7 +52,7 @@ const ProfileErrorCard: React.FC<ProfileErrorCardProps> = ({ error, onRetry }) =
                 <p className="text-slate-500 text-sm mb-6">{body}</p>
                 <button
                     onClick={onRetry}
-                    className="w-full py-2 px-4 bg-primary text-white rounded-lg font-medium hover:bg-primary-hover transition-colors"
+                    className="w-full py-3 px-4 bg-primary text-white rounded-xl font-bold hover:bg-primary-hover transition-all shadow-lg active:scale-[0.98]"
                 >
                     Tentar novamente
                 </button>
@@ -101,14 +101,16 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
         return (
             <div className="flex items-center justify-center h-screen bg-slate-50">
                 <div className="max-w-sm w-full bg-white rounded-2xl shadow-xl p-8 text-center">
-                    <AlertCircle className="w-12 h-12 text-yellow-500 mx-auto mb-4" />
+                    <div className="w-14 h-14 bg-yellow-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <AlertTriangle className="w-7 h-7 text-yellow-600" />
+                    </div>
                     <h2 className="text-lg font-bold text-slate-800 mb-2">Erro ao carregar perfil</h2>
                     <p className="text-slate-500 text-sm mb-6">
-                        Não foi possível buscar seus dados. Tente novamente.
+                        Não foi possível buscar seus dados. Verifique sua conexão e tente novamente.
                     </p>
                     <button
                         onClick={() => refreshProfile(user.id)}
-                        className="w-full py-2 px-4 bg-primary text-white rounded-lg font-medium hover:bg-primary-hover transition-colors"
+                        className="w-full py-3 px-4 bg-primary text-white rounded-xl font-bold hover:bg-primary-hover transition-all shadow-lg active:scale-[0.98]"
                     >
                         Tentar novamente
                     </button>

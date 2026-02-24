@@ -119,6 +119,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
      * Public refresh (no retry delay). Used for polling on the Pending page.
      */
     const refreshProfile = useCallback(async (userId: string): Promise<Profile | null> => {
+        setLoading(true);
         try {
             const { data, error } = await supabase
                 .from('user_profiles')
@@ -139,6 +140,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             console.error('[Auth] refreshProfile error:', err);
             setProfileError('NETWORK');
             return null;
+        } finally {
+            setLoading(false);
         }
     }, []);
 
