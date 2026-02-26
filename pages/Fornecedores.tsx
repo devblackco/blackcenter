@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
-import { Building2, Plus, Pencil, Trash2, X, Save, Loader2, Search, AlertCircle, CheckCircle, Phone, Mail, MapPin } from 'lucide-react';
+import { useSupabaseFetch } from '../hooks/useSupabaseFetch';
+import { Building2, Plus, Pencil, Trash2, X, Save, Loader2, Search, AlertCircle, CheckCircle, RefreshCw } from 'lucide-react';
 
 interface Supplier {
     id: string;
@@ -45,8 +46,6 @@ type FormState = { nome: string; cnpj: string; email: string; telefone: string; 
 const emptyForm: FormState = { nome: '', cnpj: '', email: '', telefone: '', contato: '', endereco: '', status: 'ATIVO' };
 
 const Fornecedores = () => {
-    const [suppliers, setSuppliers] = useState<Supplier[]>([]);
-    const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState('');
     const [toast, setToast] = useState<ToastMsg | null>(null);
 
@@ -56,17 +55,17 @@ const Fornecedores = () => {
     const [saving, setSaving] = useState(false);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
-    const fetchSuppliers = async () => {
-        setLoading(true);
-        const { data, error } = await supabase.from('suppliers').select('*').order('nome');
-        if (error) {
-            setToast({ type: 'error', text: 'Erro ao carregar fornecedores: ' + error.message });
-        }
-        setSuppliers((data as Supplier[]) ?? []);
-        setLoading(false);
-    };
+    // --- Resilient fetch with timeout ---
+    const [fetchKey, setFetchKey] = useState(0);
+    const { data: suppliers, loading, error, refetch } = useSupabaseFetch<Supplier[]>(
+        async (signal) => {
+            const result = await (supabase.from('suppliers').select('*').order('nome') as any).abortSignal(signal);
+            return { data: (result.data as Supplier[]) ?? [], error: result.error };
+        },
+        [fetchKey]
+    );
 
-    useEffect(() => { fetchSuppliers(); }, []);
+    const triggerRefetch = () => setFetchKey(k => k + 1);
 
     const openCreate = () => {
         setEditing(null);
@@ -106,7 +105,7 @@ const Fornecedores = () => {
 
         setSaving(false);
         setModalOpen(false);
-        fetchSuppliers();
+        triggerRefetch();
     };
 
     const handleDelete = async (id: string) => {
@@ -114,10 +113,11 @@ const Fornecedores = () => {
         if (error) { setToast({ type: 'error', text: 'Erro ao excluir: ' + error.message }); }
         else { setToast({ type: 'success', text: 'Fornecedor excluído.' }); }
         setDeleteConfirm(null);
-        fetchSuppliers();
+        triggerRefetch();
     };
 
-    const filtered = suppliers.filter(s =>
+    const items = suppliers ?? [];
+    const filtered = items.filter(s =>
         s.nome.toLowerCase().includes(search.toLowerCase()) ||
         s.cnpj.includes(search) ||
         s.contato.toLowerCase().includes(search.toLowerCase())
@@ -144,21 +144,21 @@ const Fornecedores = () => {
                     <div className="p-3 bg-blue-100 rounded-lg"><Building2 className="w-6 h-6 text-primary" /></div>
                     <div>
                         <p className="text-sm text-slate-500">Total Fornecedores</p>
-                        <p className="text-xl font-bold text-slate-900">{suppliers.length}</p>
+                        <p className="text-xl font-bold text-slate-900">{items.length}</p>
                     </div>
                 </div>
                 <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
                     <div className="p-3 bg-emerald-100 rounded-lg"><CheckCircle className="w-6 h-6 text-emerald-600" /></div>
                     <div>
                         <p className="text-sm text-slate-500">Ativos</p>
-                        <p className="text-xl font-bold text-slate-900">{suppliers.filter(s => s.status === 'ATIVO').length}</p>
+                        <p className="text-xl font-bold text-slate-900">{items.filter(s => s.status === 'ATIVO').length}</p>
                     </div>
                 </div>
                 <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
                     <div className="p-3 bg-slate-100 rounded-lg"><AlertCircle className="w-6 h-6 text-slate-400" /></div>
                     <div>
                         <p className="text-sm text-slate-500">Inativos</p>
-                        <p className="text-xl font-bold text-slate-900">{suppliers.filter(s => s.status === 'INATIVO').length}</p>
+                        <p className="text-xl font-bold text-slate-900">{items.filter(s => s.status === 'INATIVO').length}</p>
                     </div>
                 </div>
             </div>
@@ -173,7 +173,17 @@ const Fornecedores = () => {
 
             {/* Table */}
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                {loading ? (
+                {error ? (
+                    <div className="flex flex-col items-center justify-center py-16 px-4">
+                        <AlertCircle className="w-10 h-10 text-red-400 mb-3" />
+                        <p className="text-sm text-slate-700 font-medium mb-1">Falha ao carregar fornecedores</p>
+                        <p className="text-xs text-slate-500 text-center mb-4 max-w-xs">{error}</p>
+                        <button onClick={refetch} className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-primary hover:bg-primary-hover rounded-lg transition-colors">
+                            <RefreshCw className="w-4 h-4" />
+                            Tentar novamente
+                        </button>
+                    </div>
+                ) : loading ? (
                     <div className="flex items-center justify-center py-16"><Loader2 className="w-8 h-8 text-primary animate-spin" /></div>
                 ) : filtered.length === 0 ? (
                     <div className="text-center py-16">

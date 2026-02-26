@@ -49,6 +49,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // ─── Refs ────────────────────────────────────────────────────────────────
 
+    /** Guards against React state updates after unmount. */
+    const mountedRef = useRef(true);
+    useEffect(() => { return () => { mountedRef.current = false; }; }, []);
+
     /** Incremented on every fetchProfile call. Stale responses are discarded. */
     const fetchRequestRef = useRef(0);
 
@@ -173,9 +177,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 console.log(`[Auth][fetchProfile] attempt-2 in ${t2}ms — data=${!!data} error=${error?.code ?? error?.message ?? 'none'}`);
             }
 
-            // Discard result if a newer call already resolved
-            if (myRequestId !== fetchRequestRef.current) {
-                console.log(`[Auth][fetchProfile] stale response discarded (requestId=${myRequestId})`);
+            // Discard result if a newer call already resolved or component unmounted
+            if (myRequestId !== fetchRequestRef.current || !mountedRef.current) {
+                console.log(`[Auth][fetchProfile] stale/unmounted response discarded (requestId=${myRequestId})`);
                 return null;
             }
 
@@ -212,7 +216,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return null;
 
         } catch (err: any) {
-            if (myRequestId !== fetchRequestRef.current) return null;
+            if (myRequestId !== fetchRequestRef.current || !mountedRef.current) return null;
             console.error('[Auth][fetchProfile] unexpected exception:', err);
             const category = categoriseError(err);
             if (lastGoodProfileRef.current) {
@@ -265,6 +269,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Boot safety: fires only if onAuthStateChange never delivers a first event
         // (e.g. Supabase is completely unreachable at startup).
         let bootSafetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+            if (!mountedRef.current) return;
             console.warn('[Auth] Boot safety timeout (12 s) — Supabase unreachable at init');
             setProfileErrorSynced('BLOCKED');
             setLoading(false);
@@ -304,6 +309,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                         // If fetchProfile hangs (e.g. all attempts blocked), force-unblock
                         // and surface BLOCKED so the UI shows an actionable error.
                         callSafetyTimer = setTimeout(() => {
+                            if (!mountedRef.current) return;
                             console.warn(`[Auth][${event}] Per-call safety timeout (${SAFETY_TIMEOUT_MS / 1000} s) — BLOCKED`);
                             setProfileErrorSynced('BLOCKED');
                             setLoading(false);

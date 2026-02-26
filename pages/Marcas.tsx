@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
-import { Tag, Plus, Pencil, Trash2, X, Save, Loader2, Search, AlertCircle, CheckCircle } from 'lucide-react';
+import { useSupabaseFetch } from '../hooks/useSupabaseFetch';
+import { Tag, Plus, Pencil, Trash2, X, Save, Loader2, Search, AlertCircle, CheckCircle, RefreshCw } from 'lucide-react';
 
 interface Brand {
     id: string;
@@ -28,12 +29,9 @@ const Toast = ({ toast, onClose }: { toast: ToastMsg; onClose: () => void }) => 
 };
 
 const Marcas = () => {
-    const [brands, setBrands] = useState<Brand[]>([]);
-    const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState('');
     const [toast, setToast] = useState<ToastMsg | null>(null);
 
-    // Modal state
     const [modalOpen, setModalOpen] = useState(false);
     const [editing, setEditing] = useState<Brand | null>(null);
     const [formName, setFormName] = useState('');
@@ -41,17 +39,17 @@ const Marcas = () => {
     const [saving, setSaving] = useState(false);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
-    const fetchBrands = async () => {
-        setLoading(true);
-        const { data, error } = await supabase.from('brands').select('*').order('name');
-        if (error) {
-            setToast({ type: 'error', text: 'Erro ao carregar marcas: ' + error.message });
-        }
-        setBrands((data as Brand[]) ?? []);
-        setLoading(false);
-    };
+    // --- Resilient fetch with timeout ---
+    const [fetchKey, setFetchKey] = useState(0);
+    const { data: brands, loading, error, refetch } = useSupabaseFetch<Brand[]>(
+        async (signal) => {
+            const result = await (supabase.from('brands').select('*').order('name') as any).abortSignal(signal);
+            return { data: (result.data as Brand[]) ?? [], error: result.error };
+        },
+        [fetchKey]
+    );
 
-    useEffect(() => { fetchBrands(); }, []);
+    const triggerRefetch = () => setFetchKey(k => k + 1);
 
     const openCreate = () => {
         setEditing(null);
@@ -96,7 +94,7 @@ const Marcas = () => {
         setSaving(false);
         if (!hasError) {
             setModalOpen(false);
-            fetchBrands();
+            triggerRefetch();
         }
     };
 
@@ -105,10 +103,11 @@ const Marcas = () => {
         if (error) { setToast({ type: 'error', text: 'Erro ao excluir: ' + error.message }); }
         else { setToast({ type: 'success', text: 'Marca excluída.' }); }
         setDeleteConfirm(null);
-        fetchBrands();
+        triggerRefetch();
     };
 
-    const filtered = brands.filter(b =>
+    const items = brands ?? [];
+    const filtered = items.filter(b =>
         b.name.toLowerCase().includes(search.toLowerCase()) ||
         b.code.toLowerCase().includes(search.toLowerCase())
     );
@@ -143,7 +142,17 @@ const Marcas = () => {
 
             {/* Table */}
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                {loading ? (
+                {error ? (
+                    <div className="flex flex-col items-center justify-center py-16 px-4">
+                        <AlertCircle className="w-10 h-10 text-red-400 mb-3" />
+                        <p className="text-sm text-slate-700 font-medium mb-1">Falha ao carregar marcas</p>
+                        <p className="text-xs text-slate-500 text-center mb-4 max-w-xs">{error}</p>
+                        <button onClick={refetch} className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-primary hover:bg-primary-hover rounded-lg transition-colors">
+                            <RefreshCw className="w-4 h-4" />
+                            Tentar novamente
+                        </button>
+                    </div>
+                ) : loading ? (
                     <div className="flex items-center justify-center py-16">
                         <Loader2 className="w-8 h-8 text-primary animate-spin" />
                     </div>
