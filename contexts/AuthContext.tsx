@@ -282,102 +282,134 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // ─── Bootstrap ──────────────────────────────────────────────────────────
     //
-    // SINGLE SOURCE OF TRUTH: onAuthStateChange is the only place that reads
-    // the session and fetches the profile. We do NOT call getSession() separately —
-    // the listener fires INITIAL_SESSION on mount, which covers that case and
-    // eliminates the double-fetch race condition.
+    // DUAL APPROACH:
+    // 1. getSession() — fast path, resolves in <500ms. Handles the no-session
+    //    case immediately (redirect to login) and starts fetchProfile if session exists.
+    // 2. onAuthStateChange — handles subsequent events (SIGNED_IN, SIGNED_OUT,
+    //    TOKEN_REFRESHED) for the lifetime of the component.
+
+    /** Tracks whether we already bootstrapped via getSession(). */
+    const bootstrappedRef = useRef(false);
 
     useEffect(() => {
-        // Boot safety: fires only if onAuthStateChange never delivers a first event
-        // (e.g. Supabase is completely unreachable at startup).
-        let bootSafetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-            if (!mountedRef.current) return;
-            console.warn('[Auth] Boot safety timeout (12 s) — Supabase unreachable at init');
-            setProfileErrorSynced('BLOCKED');
-            setLoading(false);
-            bootSafetyTimer = null;
-        }, SAFETY_TIMEOUT_MS);
+        let mounted = true;
 
-        const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, currentSession) => {
-            console.log(`[Auth][${event}] userId=${currentSession?.user?.id ?? 'none'}`);
-
-            // One-shot: cancel boot timer as soon as we get any event
-            if (bootSafetyTimer !== null) {
-                clearTimeout(bootSafetyTimer);
-                bootSafetyTimer = null;
-            }
-
-            // Per-invocation safety timer (only armed when loading=true)
-            let callSafetyTimer: ReturnType<typeof setTimeout> | null = null;
-
+        // ── Fast path: getSession() ──────────────────────────────────────
+        const bootstrap = async () => {
             try {
-                if (event === 'SIGNED_OUT') {
-                    lastGoodProfileRef.current = null;
+                console.log('[Auth][bootstrap] calling getSession()...');
+                const { data: { session: currentSession }, error } = await supabase.auth.getSession();
+
+                if (!mounted) return;
+
+                if (error) {
+                    console.warn('[Auth][bootstrap] getSession error:', error.message);
+                }
+
+                if (currentSession) {
+                    console.log(`[Auth][bootstrap] session found for userId=${currentSession.user.id}`);
+                    setSession(currentSession);
+                    setUser(currentSession.user);
+                    bootstrappedRef.current = true;
+                    await fetchProfile(currentSession.user.id);
+                } else {
+                    console.log('[Auth][bootstrap] no session — will redirect to login');
                     setSession(null);
                     setUser(null);
                     setProfile(null);
                     setProfileErrorSynced(null);
-                    setLoading(false);
-                    return; // skip finally
+                    bootstrappedRef.current = true;
                 }
+            } catch (err) {
+                console.error('[Auth][bootstrap] unexpected error:', err);
+                bootstrappedRef.current = true;
+            } finally {
+                if (mounted) {
+                    setLoading(false);
+                }
+            }
+        };
 
-                if (currentSession) {
-                    setSession(currentSession);
-                    setUser(currentSession.user);
+        bootstrap();
 
-                    if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
-                        setLoading(true);
+        // ── Safety timeout (10s): if bootstrap never completes ───────────
+        const safetyTimer = setTimeout(() => {
+            if (!mounted || bootstrappedRef.current) return;
+            console.warn('[Auth] Safety timeout (10s) — forcing loading=false');
+            setLoading(false);
+        }, 10_000);
 
-                        // If fetchProfile hangs (e.g. all attempts blocked), force-unblock
-                        // and surface BLOCKED so the UI shows an actionable error.
-                        callSafetyTimer = setTimeout(() => {
-                            if (!mountedRef.current) return;
-                            console.warn(`[Auth][${event}] Per-call safety timeout (${SAFETY_TIMEOUT_MS / 1000} s) — BLOCKED`);
-                            setProfileErrorSynced('BLOCKED');
-                            setLoading(false);
-                        }, SAFETY_TIMEOUT_MS);
+        // ── onAuthStateChange: handles ongoing events ────────────────────
+        const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, currentSession) => {
+            console.log(`[Auth][${event}] userId=${currentSession?.user?.id ?? 'none'} bootstrapped=${bootstrappedRef.current}`);
 
+            // Skip INITIAL_SESSION — already handled by getSession() above
+            if (event === 'INITIAL_SESSION') {
+                // If getSession() hasn't resolved yet (race), handle it here as fallback
+                if (!bootstrappedRef.current) {
+                    console.log('[Auth][INITIAL_SESSION] fallback — getSession() was slower');
+                    bootstrappedRef.current = true;
+                    if (currentSession) {
+                        setSession(currentSession);
+                        setUser(currentSession.user);
                         await fetchProfile(currentSession.user.id);
-
-                    } else if (event === 'TOKEN_REFRESHED') {
-                        // JWT rotated. Profile data hasn't changed — no need to re-fetch normally.
-                        // EXCEPTION: use TOKEN_REFRESHED as recovery opportunity when the profile
-                        // is missing or in error state (e.g. the SIGNED_IN fetch was blocked earlier).
-                        const profileIsStale = !lastGoodProfileRef.current;
-                        const hasError = profileErrorRef.current !== null;
-
-                        if (profileIsStale || hasError) {
-                            console.log(`[Auth][TOKEN_REFRESHED] recovery re-fetch — profileStale=${profileIsStale} hasError=${hasError}`);
-                            await refreshProfile(currentSession.user.id);
-                        } else {
-                            console.log('[Auth][TOKEN_REFRESHED] session rotated — profile intact, skipping re-fetch');
-                        }
-                    }
-
-                } else {
-                    // currentSession === null could be a brief Supabase blip before TOKEN_REFRESHED.
-                    // Only wipe state if there is no confirmed good profile to preserve.
-                    if (lastGoodProfileRef.current) {
-                        console.warn('[Auth] currentSession=null with cached profile — likely transient; waiting for TOKEN_REFRESHED');
                     } else {
                         setSession(null);
                         setUser(null);
                         setProfile(null);
                         setProfileErrorSynced(null);
                     }
+                    if (mounted) setLoading(false);
                 }
+                return;
+            }
 
-            } catch (err) {
-                console.error(`[Auth][${event}] handler error:`, err);
-                setProfileErrorSynced(categoriseError(err));
-            } finally {
-                if (callSafetyTimer !== null) clearTimeout(callSafetyTimer);
+            if (event === 'SIGNED_OUT') {
+                lastGoodProfileRef.current = null;
+                setSession(null);
+                setUser(null);
+                setProfile(null);
+                setProfileErrorSynced(null);
                 setLoading(false);
+                return;
+            }
+
+            if (currentSession) {
+                setSession(currentSession);
+                setUser(currentSession.user);
+
+                if (event === 'SIGNED_IN') {
+                    setLoading(true);
+                    await fetchProfile(currentSession.user.id);
+                    if (mounted) setLoading(false);
+
+                } else if (event === 'TOKEN_REFRESHED') {
+                    const profileIsStale = !lastGoodProfileRef.current;
+                    const hasError = profileErrorRef.current !== null;
+
+                    if (profileIsStale || hasError) {
+                        console.log(`[Auth][TOKEN_REFRESHED] recovery re-fetch — profileStale=${profileIsStale} hasError=${hasError}`);
+                        await refreshProfile(currentSession.user.id);
+                    } else {
+                        console.log('[Auth][TOKEN_REFRESHED] session rotated — profile intact, skipping re-fetch');
+                    }
+                }
+            } else {
+                // currentSession === null could be a brief Supabase blip before TOKEN_REFRESHED.
+                if (lastGoodProfileRef.current) {
+                    console.warn('[Auth] currentSession=null with cached profile — likely transient; waiting for TOKEN_REFRESHED');
+                } else {
+                    setSession(null);
+                    setUser(null);
+                    setProfile(null);
+                    setProfileErrorSynced(null);
+                }
             }
         });
 
         return () => {
-            if (bootSafetyTimer !== null) clearTimeout(bootSafetyTimer);
+            mounted = false;
+            clearTimeout(safetyTimer);
             subscription.unsubscribe();
         };
     }, [fetchProfile, refreshProfile, categoriseError, setProfileErrorSynced]);
