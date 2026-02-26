@@ -36,9 +36,9 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 // ─── Timeouts ────────────────────────────────────────────────────────────────
 /** Each fetch attempt is aborted if it doesn't respond within this time. */
-const FETCH_TIMEOUT_MS = 8_000;
+const FETCH_TIMEOUT_MS = 15_000;
 /** If the entire fetchProfile sequence (attempt + retry) exceeds this, force-unblock. */
-const SAFETY_TIMEOUT_MS = 12_000;
+const SAFETY_TIMEOUT_MS = 20_000;
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [user, setUser] = useState<User | null>(null);
@@ -80,8 +80,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const categoriseError = useCallback((error: any): ProfileError => {
         if (!error) return 'NETWORK';
 
-        // AbortError: our AbortController fired (timeout or deliberate cancel)
-        if (error?.name === 'AbortError' || error?.code === 'ABORT') return 'BLOCKED';
+        // AbortError from OUR OWN timeout timer → treat as slow network, not block
+        if (error?.name === 'AbortError' || error?.code === 'ABORT') return 'NETWORK';
 
         // Browser/extension/VPN intercepted the request before it left the browser
         if (
@@ -100,12 +100,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (error?.status === 401 || error?.status === 403) return 'ACCESS_DENIED';
 
         // Generic network/fetch failures (TypeError: Failed to fetch, etc.)
+        // Could be a browser extension block OR just a slow/failed connection
         if (
             error?.name === 'TypeError' ||
             error?.message?.toLowerCase?.().includes('fetch') ||
             error?.message?.toLowerCase?.().includes('network') ||
             error?.message?.toLowerCase?.().includes('failed to')
-        ) return 'BLOCKED'; // "Failed to fetch" = browser didn't send the request
+        ) return 'NETWORK'; // Prefer NETWORK so ProtectedRoute auto-retries
 
         return 'NETWORK';
     }, []);
@@ -129,15 +130,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return { data: data as Profile | null, error };
         } catch (err: any) {
             if (err?.name === 'AbortError') {
-                console.warn(`[Auth][attempt] aborted after ${FETCH_TIMEOUT_MS / 1000} s — likely blocked by browser/extension/VPN`);
+                console.warn(`[Auth][attempt] aborted after ${FETCH_TIMEOUT_MS / 1000} s — slow connection or temporary issue`);
                 return {
                     data: null,
-                    error: { name: 'AbortError', code: 'ABORT', message: `Request abortada após ${FETCH_TIMEOUT_MS / 1000} s (browser pode estar bloqueando o Supabase via VPN/extensão)` },
+                    error: { name: 'AbortError', code: 'ABORT', message: `Conexão lenta — tempo esgotado após ${FETCH_TIMEOUT_MS / 1000} s` },
                 };
             }
             if (err?.name === 'TypeError') {
-                console.warn('[Auth][attempt] TypeError (Failed to fetch) — request never left browser:', err.message);
-                return { data: null, error: { name: 'TypeError', code: 'BLOCKED', message: err.message } };
+                console.warn('[Auth][attempt] TypeError (Failed to fetch) — network issue:', err.message);
+                return { data: null, error: { name: 'TypeError', code: 'NETWORK', message: err.message } };
             }
             return { data: null, error: err };
         } finally {

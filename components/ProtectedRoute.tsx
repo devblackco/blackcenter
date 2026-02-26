@@ -1,15 +1,23 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Navigate, Outlet } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import type { UserRole } from '../types';
 import { useRole } from '../hooks/useRole';
 import type { ProfileError } from '../contexts/AuthContext';
-import { AlertTriangle, ShieldOff, WifiOff, UserX, Settings, Shield } from 'lucide-react';
+import { AlertTriangle, ShieldOff, WifiOff, UserX, Settings, Shield, RefreshCw } from 'lucide-react';
 
 interface ProtectedRouteProps {
     children?: React.ReactNode;
     requiredRole?: UserRole;
 }
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const MAX_AUTO_RETRIES = 3;
+const RETRY_DELAY_MS = 2_000;
+
+/** Errors that should be auto-retried before showing the error card. */
+const RETRYABLE_ERRORS: Set<NonNullable<ProfileError>> = new Set(['NETWORK', 'BLOCKED']);
 
 // ─── Error state UI ──────────────────────────────────────────────────────────
 
@@ -44,7 +52,7 @@ const profileErrorConfig: Record<
     BLOCKED: {
         icon: Shield,
         iconClass: 'text-purple-500',
-        title: 'Request bloqueada',
+        title: 'Conexão bloqueada',
         body: 'O browser impediu a conexão com o servidor. Desative VPN, extensões de privacidade ou adblock e tente novamente.',
     },
 };
@@ -79,15 +87,72 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
     const { user, profile, loading, profileError, refreshProfile } = useAuth();
     const { hasPermission } = useRole();
 
-    console.log(`[ProtectedRoute] loading=${loading} user=${user?.id ?? 'none'} profile=${profile?.status ?? 'null'} profileError=${profileError}`);
+    // Auto-retry state: tracks retries for NETWORK/BLOCKED errors
+    const [retrying, setRetrying] = useState(false);
+    const retryCountRef = useRef(0);
+    const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    // Reset retry counter whenever we get a successful profile load
+    useEffect(() => {
+        if (profile) {
+            retryCountRef.current = 0;
+            setRetrying(false);
+        }
+    }, [profile]);
+
+    // Auto-retry on retryable errors (NETWORK, BLOCKED)
+    useEffect(() => {
+        if (
+            !loading &&
+            !profile &&
+            profileError &&
+            RETRYABLE_ERRORS.has(profileError) &&
+            user &&
+            retryCountRef.current < MAX_AUTO_RETRIES
+        ) {
+            retryCountRef.current += 1;
+            const attempt = retryCountRef.current;
+            console.log(`[ProtectedRoute] Auto-retry ${attempt}/${MAX_AUTO_RETRIES} for ${profileError} in ${RETRY_DELAY_MS / 1000}s`);
+            setRetrying(true);
+
+            retryTimerRef.current = setTimeout(() => {
+                refreshProfile(user.id);
+            }, RETRY_DELAY_MS);
+
+            return () => {
+                if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+            };
+        }
+
+        // If we exhausted retries, stop the retrying state
+        if (retryCountRef.current >= MAX_AUTO_RETRIES) {
+            setRetrying(false);
+        }
+    }, [loading, profile, profileError, user, refreshProfile]);
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+        };
+    }, []);
+
+    console.log(`[ProtectedRoute] loading=${loading} user=${user?.id ?? 'none'} profile=${profile?.status ?? 'null'} profileError=${profileError} retrying=${retrying} retryCount=${retryCountRef.current}`);
 
     // Still initialising auth or fetching profile — wait
-    if (loading) {
+    if (loading || retrying) {
         return (
             <div className="flex items-center justify-center h-screen bg-slate-50">
                 <div className="text-center">
                     <div className="w-16 h-16 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                    <p className="text-slate-600 font-medium">Carregando...</p>
+                    <p className="text-slate-600 font-medium">
+                        {retrying ? 'Reconectando...' : 'Carregando...'}
+                    </p>
+                    {retrying && (
+                        <p className="text-slate-400 text-sm mt-2">
+                            Tentativa {retryCountRef.current} de {MAX_AUTO_RETRIES}
+                        </p>
+                    )}
                 </div>
             </div>
         );
@@ -98,12 +163,16 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
         return <Navigate to="/login" replace />;
     }
 
-    // Profile failed to load — show categorised error card
+    // Profile failed to load — show categorised error card (only after retries exhausted)
     if (!profile && profileError) {
         return (
             <ProfileErrorCard
                 error={profileError}
-                onRetry={() => refreshProfile(user.id)}
+                onRetry={() => {
+                    retryCountRef.current = 0;
+                    setRetrying(true);
+                    refreshProfile(user.id);
+                }}
             />
         );
     }
