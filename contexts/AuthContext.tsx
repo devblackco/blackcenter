@@ -37,8 +37,8 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 // ─── Timeouts ────────────────────────────────────────────────────────────────
 /** Each fetch attempt is aborted if it doesn't respond within this time. */
 const FETCH_TIMEOUT_MS = 15_000;
-/** If the entire fetchProfile sequence (attempt + retry) exceeds this, force-unblock. */
-const SAFETY_TIMEOUT_MS = 20_000;
+/** If the entire fetchProfile sequence (5 attempts + backoff) exceeds this, force-unblock. */
+const SAFETY_TIMEOUT_MS = 120_000;
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [user, setUser] = useState<User | null>(null);
@@ -148,69 +148,90 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     /**
      * Fetches and commits the profile for a given userId.
-     * - Retries once after 1.5 s (handles slow signup trigger).
-     * - On transient errors (BLOCKED/NETWORK): preserves the last-good profile in memory
+     * - Retries up to MAX_PROFILE_RETRIES times with exponential backoff.
+     * - Only gives up on definitive errors (NOT_FOUND, ACCESS_DENIED, ENV_MISSING).
+     * - On transient errors (NETWORK/BLOCKED): preserves the last-good profile in memory
      *   so a working session isn't destroyed by a momentary blip.
      * - Uses fetchRequestRef to discard stale concurrent responses.
      */
     const fetchProfile = useCallback(async (userId: string): Promise<Profile | null> => {
         const myRequestId = ++fetchRequestRef.current;
         const startedAt = Date.now();
+        const MAX_RETRIES = 5;
+        const BACKOFF_DELAYS = [1500, 3000, 5000, 8000, 10000]; // ms between retries
 
-        console.log(`[Auth][fetchProfile] START userId=${userId} requestId=${myRequestId} t=0ms`);
+        console.log(`[Auth][fetchProfile] START userId=${userId} requestId=${myRequestId} t=0ms maxRetries=${MAX_RETRIES}`);
 
         try {
-            let { data, error } = await attempt(userId);
+            let lastError: any = null;
 
-            const t1 = Date.now() - startedAt;
-            console.log(`[Auth][fetchProfile] attempt-1 in ${t1}ms — data=${!!data} error=${error?.code ?? error?.message ?? 'none'}`);
+            for (let i = 0; i < MAX_RETRIES; i++) {
+                // Check if stale or unmounted
+                if (myRequestId !== fetchRequestRef.current || !mountedRef.current) {
+                    console.log(`[Auth][fetchProfile] stale/unmounted — aborting (requestId=${myRequestId})`);
+                    return null;
+                }
 
-            // Retry once when no data yet (slow trigger or transient failure)
-            if (!data) {
-                const reason = error
-                    ? `code=${error.code ?? error.name} msg="${error.message}"`
-                    : 'maybeSingle returned null (row may not exist yet)';
-                console.log(`[Auth][fetchProfile] retrying in 1.5 s — ${reason} (requestId=${myRequestId})`);
-                await new Promise(resolve => setTimeout(resolve, 1500));
-                ({ data, error } = await attempt(userId));
+                const { data, error } = await attempt(userId);
+                const elapsed = Date.now() - startedAt;
+                console.log(`[Auth][fetchProfile] attempt-${i + 1}/${MAX_RETRIES} in ${elapsed}ms — data=${!!data} error=${error?.code ?? error?.message ?? 'none'}`);
 
-                const t2 = Date.now() - startedAt;
-                console.log(`[Auth][fetchProfile] attempt-2 in ${t2}ms — data=${!!data} error=${error?.code ?? error?.message ?? 'none'}`);
+                // Check stale again after await
+                if (myRequestId !== fetchRequestRef.current || !mountedRef.current) {
+                    console.log(`[Auth][fetchProfile] stale/unmounted after attempt — aborting (requestId=${myRequestId})`);
+                    return null;
+                }
+
+                // Success!
+                if (data) {
+                    console.log(`[Auth][fetchProfile] SUCCESS status=${data.status} role=${data.role} t=${elapsed}ms (attempt ${i + 1})`);
+                    lastGoodProfileRef.current = data;
+                    setProfile(data);
+                    setProfileErrorSynced(null);
+                    return data;
+                }
+
+                // data=null, error=null → row definitively missing (no point retrying)
+                if (!error) {
+                    console.warn(`[Auth][fetchProfile] MISSING — no user_profiles row for userId=${userId}`);
+                    lastGoodProfileRef.current = null;
+                    setProfile(null);
+                    setProfileErrorSynced('NOT_FOUND');
+                    return null;
+                }
+
+                // Categorize the error
+                const category = categoriseError(error);
+                lastError = error;
+
+                // Definitive errors — stop retrying immediately
+                if (category === 'NOT_FOUND' || category === 'ACCESS_DENIED' || category === 'ENV_MISSING') {
+                    console.warn(`[Auth][fetchProfile] DEFINITIVE error: ${category} — stopping retries`);
+                    if (lastGoodProfileRef.current && category !== 'ENV_MISSING') {
+                        setProfileErrorSynced(category);
+                    } else {
+                        setProfile(null);
+                        setProfileErrorSynced(category);
+                    }
+                    return null;
+                }
+
+                // Transient error (NETWORK, BLOCKED) — wait and retry
+                if (i < MAX_RETRIES - 1) {
+                    const delay = BACKOFF_DELAYS[i] ?? 10000;
+                    console.log(`[Auth][fetchProfile] transient error (${category}) — retrying in ${delay / 1000}s (attempt ${i + 1}/${MAX_RETRIES})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
             }
 
-            // Discard result if a newer call already resolved or component unmounted
-            if (myRequestId !== fetchRequestRef.current || !mountedRef.current) {
-                console.log(`[Auth][fetchProfile] stale/unmounted response discarded (requestId=${myRequestId})`);
-                return null;
-            }
-
-            if (data) {
-                console.log(`[Auth][fetchProfile] SUCCESS status=${data.status} role=${data.role} t=${Date.now() - startedAt}ms`);
-                lastGoodProfileRef.current = data;
-                setProfile(data);
-                setProfileErrorSynced(null);
-                return data;
-            }
-
-            // data=null, error=null → row definitively missing
-            if (!error) {
-                console.warn(`[Auth][fetchProfile] MISSING — no user_profiles row for userId=${userId}`);
-                lastGoodProfileRef.current = null;
-                setProfile(null);
-                setProfileErrorSynced('NOT_FOUND');
-                return null;
-            }
-
-            // Real error (BLOCKED, NETWORK, ACCESS_DENIED, etc.)
-            const category = categoriseError(error);
-            console.warn(`[Auth][fetchProfile] FAILED category=${category} code=${error?.code} status=${error?.status} msg="${error?.message}" t=${Date.now() - startedAt}ms`);
+            // Exhausted all retries
+            const category = categoriseError(lastError);
+            console.warn(`[Auth][fetchProfile] EXHAUSTED ${MAX_RETRIES} retries — category=${category} t=${Date.now() - startedAt}ms`);
 
             if (lastGoodProfileRef.current) {
-                // Transient failure with cached profile: keep user logged in, show soft error
                 console.log('[Auth][fetchProfile] preserving last-good profile — session stays alive');
                 setProfileErrorSynced(category);
             } else {
-                // First load with no cache: must surface the error fully
                 setProfile(null);
                 setProfileErrorSynced(category);
             }

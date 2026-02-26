@@ -13,13 +13,17 @@ interface ProtectedRouteProps {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const MAX_AUTO_RETRIES = 3;
-const RETRY_DELAY_MS = 2_000;
+/** Errors that are NEVER auto-retried — they require user action. */
+const DEFINITIVE_ERRORS: Set<NonNullable<ProfileError>> = new Set([
+    'NOT_FOUND',
+    'ACCESS_DENIED',
+    'ENV_MISSING',
+]);
 
-/** Errors that should be auto-retried before showing the error card. */
-const RETRYABLE_ERRORS: Set<NonNullable<ProfileError>> = new Set(['NETWORK', 'BLOCKED']);
+/** Retry interval for transient errors (NETWORK, BLOCKED). */
+const RETRY_INTERVAL_MS = 5_000;
 
-// ─── Error state UI ──────────────────────────────────────────────────────────
+// ─── Error state UI (only for definitive errors) ────────────────────────────
 
 const profileErrorConfig: Record<
     NonNullable<ProfileError>,
@@ -47,7 +51,7 @@ const profileErrorConfig: Record<
         icon: Settings,
         iconClass: 'text-orange-500',
         title: 'Configuração ausente',
-        body: 'As variáveis VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY não estão configuradas neste ambiente. Adicione-as nas configurações da Vercel.',
+        body: 'As variáveis VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY não estão configuradas neste ambiente.',
     },
     BLOCKED: {
         icon: Shield,
@@ -87,71 +91,54 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
     const { user, profile, loading, profileError, refreshProfile } = useAuth();
     const { hasPermission } = useRole();
 
-    // Auto-retry state: tracks retries for NETWORK/BLOCKED errors
-    const [retrying, setRetrying] = useState(false);
-    const retryCountRef = useRef(0);
-    const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // ── Infinite background retry for transient errors (NETWORK / BLOCKED) ──
+    // The user sees only a spinner saying "Reconectando..." — never an error card.
+    const retryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-    // Reset retry counter whenever we get a successful profile load
     useEffect(() => {
-        if (profile) {
-            retryCountRef.current = 0;
-            setRetrying(false);
-        }
-    }, [profile]);
+        // Start retrying only when: not loading, no profile, error is transient, user exists
+        const isTransient = profileError && !DEFINITIVE_ERRORS.has(profileError);
 
-    // Auto-retry on retryable errors (NETWORK, BLOCKED)
-    useEffect(() => {
-        if (
-            !loading &&
-            !profile &&
-            profileError &&
-            RETRYABLE_ERRORS.has(profileError) &&
-            user &&
-            retryCountRef.current < MAX_AUTO_RETRIES
-        ) {
-            retryCountRef.current += 1;
-            const attempt = retryCountRef.current;
-            console.log(`[ProtectedRoute] Auto-retry ${attempt}/${MAX_AUTO_RETRIES} for ${profileError} in ${RETRY_DELAY_MS / 1000}s`);
-            setRetrying(true);
-
-            retryTimerRef.current = setTimeout(() => {
-                refreshProfile(user.id);
-            }, RETRY_DELAY_MS);
-
-            return () => {
-                if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-            };
+        if (!loading && !profile && isTransient && user) {
+            // Start interval if not already running
+            if (!retryTimerRef.current) {
+                console.log(`[ProtectedRoute] Starting background retry every ${RETRY_INTERVAL_MS / 1000}s for ${profileError}`);
+                retryTimerRef.current = setInterval(() => {
+                    console.log(`[ProtectedRoute] Background retry tick — refreshing profile for ${user.id}`);
+                    refreshProfile(user.id);
+                }, RETRY_INTERVAL_MS);
+            }
+        } else {
+            // Clear interval when no longer needed (profile loaded, or definitive error)
+            if (retryTimerRef.current) {
+                clearInterval(retryTimerRef.current);
+                retryTimerRef.current = null;
+            }
         }
 
-        // If we exhausted retries, stop the retrying state
-        if (retryCountRef.current >= MAX_AUTO_RETRIES) {
-            setRetrying(false);
-        }
+        return () => {
+            if (retryTimerRef.current) {
+                clearInterval(retryTimerRef.current);
+                retryTimerRef.current = null;
+            }
+        };
     }, [loading, profile, profileError, user, refreshProfile]);
 
-    // Cleanup on unmount
-    useEffect(() => {
-        return () => {
-            if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-        };
-    }, []);
+    // ── Determine what to render ──
 
-    console.log(`[ProtectedRoute] loading=${loading} user=${user?.id ?? 'none'} profile=${profile?.status ?? 'null'} profileError=${profileError} retrying=${retrying} retryCount=${retryCountRef.current}`);
+    const isTransientError = profileError && !DEFINITIVE_ERRORS.has(profileError);
 
-    // Still initialising auth or fetching profile — wait
-    if (loading || retrying) {
+    // Still loading OR we have a transient error (auto-retrying in background) → spinner
+    if (loading || (!profile && isTransientError)) {
         return (
             <div className="flex items-center justify-center h-screen bg-slate-50">
                 <div className="text-center">
                     <div className="w-16 h-16 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
                     <p className="text-slate-600 font-medium">
-                        {retrying ? 'Reconectando...' : 'Carregando...'}
+                        {isTransientError ? 'Reconectando...' : 'Carregando...'}
                     </p>
-                    {retrying && (
-                        <p className="text-slate-400 text-sm mt-2">
-                            Tentativa {retryCountRef.current} de {MAX_AUTO_RETRIES}
-                        </p>
+                    {isTransientError && (
+                        <p className="text-slate-400 text-xs mt-2">Tentando conectar ao servidor</p>
                     )}
                 </div>
             </div>
@@ -163,16 +150,12 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
         return <Navigate to="/login" replace />;
     }
 
-    // Profile failed to load — show categorised error card (only after retries exhausted)
+    // Profile failed to load with a DEFINITIVE error — show error card
     if (!profile && profileError) {
         return (
             <ProfileErrorCard
                 error={profileError}
-                onRetry={() => {
-                    retryCountRef.current = 0;
-                    setRetrying(true);
-                    refreshProfile(user.id);
-                }}
+                onRetry={() => window.location.reload()}
             />
         );
     }
@@ -190,7 +173,7 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
                         Não foi possível buscar seus dados. Verifique sua conexão e tente novamente.
                     </p>
                     <button
-                        onClick={() => refreshProfile(user.id)}
+                        onClick={() => window.location.reload()}
                         className="w-full py-3 px-4 bg-primary text-white rounded-xl font-bold hover:bg-primary-hover transition-all shadow-lg active:scale-[0.98]"
                     >
                         Tentar novamente
