@@ -96,13 +96,14 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
     const retryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
     useEffect(() => {
-        // Start retrying only when: not loading, no profile, error is transient, user exists
-        const isTransient = profileError && !DEFINITIVE_ERRORS.has(profileError);
+        // Start retrying when we have an authenticated user without profile and
+        // there is no definitive error. Covers transient errors AND no-error limbo states.
+        const needsRecovery = !loading && !profile && user && (!profileError || !DEFINITIVE_ERRORS.has(profileError));
 
-        if (!loading && !profile && isTransient && user) {
+        if (needsRecovery) {
             // Start interval if not already running
             if (!retryTimerRef.current) {
-                console.log(`[ProtectedRoute] Starting background retry every ${RETRY_INTERVAL_MS / 1000}s for ${profileError}`);
+                console.log(`[ProtectedRoute] Starting background retry every ${RETRY_INTERVAL_MS / 1000}s (profileError=${profileError ?? 'none'})`);
                 retryTimerRef.current = setInterval(() => {
                     console.log(`[ProtectedRoute] Background retry tick — refreshing profile for ${user.id}`);
                     refreshProfile(user.id);
@@ -127,17 +128,18 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children, requir
     // ── Determine what to render ──
 
     const isTransientError = profileError && !DEFINITIVE_ERRORS.has(profileError);
+    const shouldReconnect = !loading && !!user && !profile && (!profileError || isTransientError);
 
     // Still loading OR we have a transient error (auto-retrying in background) → spinner
-    if (loading || (!profile && isTransientError)) {
+    if (loading || shouldReconnect) {
         return (
             <div className="flex items-center justify-center h-screen bg-slate-50">
                 <div className="text-center">
                     <div className="w-16 h-16 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
                     <p className="text-slate-600 font-medium">
-                        {isTransientError ? 'Reconectando...' : 'Carregando...'}
+                        {(isTransientError || shouldReconnect) ? 'Reconectando...' : 'Carregando...'}
                     </p>
-                    {isTransientError && (
+                    {(isTransientError || shouldReconnect) && (
                         <p className="text-slate-400 text-xs mt-2">Tentando conectar ao servidor</p>
                     )}
                 </div>

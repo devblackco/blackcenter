@@ -47,6 +47,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const [loading, setLoading] = useState(true);
     const [profileError, setProfileError] = useState<ProfileError>(null);
 
+    // Keep live refs to avoid stale closures in timers/listeners.
+    const userRef = useRef<User | null>(null);
+    const profileRef = useRef<Profile | null>(null);
+    useEffect(() => { userRef.current = user; }, [user]);
+    useEffect(() => { profileRef.current = profile; }, [profile]);
+
     // ─── Refs ────────────────────────────────────────────────────────────────
 
     /** Guards against React state updates after unmount. */
@@ -280,6 +286,43 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
     }, [attempt, categoriseError, setProfileErrorSynced]);
 
+    /**
+     * Recovery path for when browser throttles timers/network while tab is hidden.
+     * Re-checks current session and tries to silently recover profile if needed.
+     */
+    const recoverSessionAndProfile = useCallback(async (reason: 'focus' | 'visibility' | 'online') => {
+        try {
+            console.log(`[Auth][recover] trigger=${reason} — checking session`);
+            const { data: { session: currentSession }, error } = await supabase.auth.getSession();
+
+            if (!mountedRef.current) return;
+
+            if (error) {
+                console.warn(`[Auth][recover] getSession error (${reason}):`, error.message);
+            }
+
+            if (currentSession) {
+                setSession(currentSession);
+                setUser(currentSession.user);
+
+                const profileMissing = !lastGoodProfileRef.current || !profileRef.current;
+                const hasError = profileErrorRef.current !== null;
+
+                if (profileMissing || hasError) {
+                    console.log(`[Auth][recover] recovering profile — missing=${profileMissing} hasError=${hasError}`);
+                    await refreshProfile(currentSession.user.id);
+                }
+            } else if (!lastGoodProfileRef.current) {
+                setSession(null);
+                setUser(null);
+                setProfile(null);
+                setProfileErrorSynced(null);
+            }
+        } catch (err) {
+            console.error(`[Auth][recover] unexpected error (${reason}):`, err);
+        }
+    }, [refreshProfile, setProfileErrorSynced]);
+
     // ─── Bootstrap ──────────────────────────────────────────────────────────
     //
     // DUAL APPROACH:
@@ -336,6 +379,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const safetyTimer = setTimeout(() => {
             if (!mounted || bootstrappedRef.current) return;
             console.warn('[Auth] Safety timeout (10s) — forcing loading=false');
+
+            // Important: avoid ending in loading=false + profile=null + error=null,
+            // which yields a hard error screen with no auto-recovery path.
+            if (userRef.current && !lastGoodProfileRef.current && !profileErrorRef.current) {
+                setProfileErrorSynced('NETWORK');
+            }
+
             setLoading(false);
         }, 10_000);
 
@@ -413,6 +463,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             subscription.unsubscribe();
         };
     }, [fetchProfile, refreshProfile, categoriseError, setProfileErrorSynced]);
+
+    // Recovery listeners for background tab/inactivity scenarios.
+    useEffect(() => {
+        const onFocus = () => { void recoverSessionAndProfile('focus'); };
+        const onOnline = () => { void recoverSessionAndProfile('online'); };
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'visible') {
+                void recoverSessionAndProfile('visibility');
+            }
+        };
+
+        window.addEventListener('focus', onFocus);
+        window.addEventListener('online', onOnline);
+        document.addEventListener('visibilitychange', onVisibilityChange);
+
+        return () => {
+            window.removeEventListener('focus', onFocus);
+            window.removeEventListener('online', onOnline);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+        };
+    }, [recoverSessionAndProfile]);
 
     // ─── Auth Actions ────────────────────────────────────────────────────────
 
